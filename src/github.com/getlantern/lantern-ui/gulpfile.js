@@ -125,7 +125,18 @@
     });
   });
 
+  gulp.task('dist-server', ['dist-env', 'ws', 'watchScss'], function() {
+    bs.init({
+      proxy: {
+        target: lanternBackend,
+        ws: true
+      },
+      serveStatic: ['.', 'dist']
+    });
+  });
+
   gulp.task('default', ['server', 'dev-env', 'mock'], function() {
     // place code for your default task here
   });
+
 }());
