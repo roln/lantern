@@ -2,19 +2,26 @@
   'use strict';
   var console = require('console');
   var gulp = require('gulp');
+  var util = require('gulp-util');
   var compass = require('gulp-compass');
   var usemin = require('gulp-usemin');
   var uglify = require('gulp-uglify');
   var minifyHtml = require('gulp-minify-html');
   var minifyCss = require('gulp-minify-css');
   var rev = require('gulp-rev');
-  var livereload = require('gulp-livereload');
   var ngConfig = require('gulp-ng-config');
   var del = require('del');
   var fs = require('fs');
   var raml_mock = require('raml-mocker-server');
+  var bs = require('browser-sync').create();
+  var ws = require('ws').Server;
+
 
   var scssGlob = 'app/scss/*.scss';
+  var lanternBackendPort = 3031;
+  var lanternBackend = 'http://localhost:' + lanternBackendPort;
+  var mockProApiPort = 3032;
+  var mockProApi = 'http://localhost:' + mockProApiPort;
 
   gulp.task('compass', function() {
     gulp.src(scssGlob)
@@ -57,11 +64,12 @@
   gulp.task('mock', function() {
     fs.access('pro-spec', function(err) {
       if (err) {
-        console.log('please `ln -s` pro-spec folder first!');
+        util.log('please `ln -s` pro-spec folder first!');
       } else {
+        util.log('Starting mock pro server at localhost:', mockProApiPort);
         raml_mock({
           path: "pro-spec",
-          port: 3030,
+          port: mockProApiPort,
           debug: true,
           watch: true
         });
@@ -73,7 +81,10 @@
     gulp.src('config/env.json')
     .pipe(ngConfig('app.constants', {
       environment: 'dev',
-      createModule: false
+      createModule: false,
+      constants: {
+        "PRO_API": mockProApi
+      }
     }))
     .pipe(gulp.dest('app/js/'));
   });
@@ -87,13 +98,34 @@
     .pipe(gulp.dest('app/js/'));
   });
 
-  gulp.task('watch', function() {
-    livereload.listen();
+  gulp.task('watchScss', function() {
     //watch .scss files
     gulp.watch(scssGlob, ['compass']);
   });
 
-  gulp.task('default', ['watch', 'dev-env', 'mock'], function() {
+  gulp.task('ws', function() {
+    util.log('Starting mock Lantern backend (WebSocket) at ' + lanternBackend + '/data');
+    ws({port: lanternBackendPort, path: '/data'}).on('connection', function(ws) {
+      ws.on('message', function(message) {
+        util.log('Lantern backend received: %s', message);
+      });
+      ws.send(JSON.stringify({Type: "mocked"}));
+    });
+  });
+
+  // Use browser-sync to proxy websocket to mock lantern backend and serve
+  // static files at same time (sacrificed livereload ability).
+  gulp.task('server', ['ws', 'watchScss'], function() {
+    bs.init({
+      proxy: {
+        target: lanternBackend,
+        ws: true
+      },
+      serveStatic: ['.', 'app']
+    });
+  });
+
+  gulp.task('default', ['server', 'dev-env', 'mock'], function() {
     // place code for your default task here
   });
 }());
