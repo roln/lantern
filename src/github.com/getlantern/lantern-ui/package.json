@@ -10,12 +10,12 @@
     }
   ],
   "bin": {
-    "web-server": "./scripts/web-server.js"
+    "web-server": "gulp"
   },
   "scripts": {
     "predeploy": "rm -f ./package.json && cp ./app/data/package.json .",
     "postdeploy": "rm -f ./package.json && ln -s ./app/data/package.json .",
-    "start": "scripts/web-server.js"
+    "start": "gulp"
   },
   "repository": {
     "type": "git",
