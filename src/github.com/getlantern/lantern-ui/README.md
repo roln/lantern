@@ -20,16 +20,20 @@ Install required dependencies (`sudo` as necessary):
 * [Node.js](http://nodejs.org/): `brew install node` or equivalent for your
 system
 
+* [Gulp](http://gulpjs.com/): `npm install --g gulp`
+
 * [Bower](http://bower.io): `npm install -g bower` (only needed if you want to
 be able to update dependencies; they're already checked in to the
-app/bower_components directory so you don't need bower just to fetch them).
+app/bower\_components directory so you don't need bower just to fetch them).
 
 * run `npm install` to fetch dependencies specified in package.json
 
-* run `npm start`
+* run `npm start` or `gulp`.
 
-You should get a message telling you the application is up and running with a
-link to access it.
+The development UI will be open in you default browser automatically.
+
+Lovereload doesn't work due to some unknown issue, you need to refresh page
+manually for any changes to take effective.
 
 ### For working on the stylesheets:
 
@@ -40,11 +44,8 @@ link to access it.
 * [compass](http://compass-style.org/) 0.12.2: `gem install compass --version
 '= 0.12.2'`.
 
-Tell compass to watch for changes in the sass stylesheets and automatically
-compile them into css in the directory specified by the compass config file
-(`config/compass.rb`):
-
-    $ gulp watch
+compass config file is under `config/compass.rb`. `gulp` will watch for changes
+of scss files.
 
 
 ## Build
