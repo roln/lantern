@@ -101,6 +101,14 @@ and [PhantomJS](http://phantomjs.org/) (brew install phantomjs).
 Then look in `.travis.yml` for the commands to run the unit and end-to-end
 tests.
 
+For end-to-end test, additional packages are required:
+
+    npm install -g cucumber protractor
+    webdriver-manager update
+    webdriver-manager start
+
+Then `gulp test`.
+
 **TODO**: *expand this*
 
 

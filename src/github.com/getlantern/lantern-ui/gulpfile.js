@@ -1,3 +1,4 @@
+/*global require */
 (function () {
   'use strict';
   var console = require('console');
@@ -10,6 +11,7 @@
   var minifyCss = require('gulp-minify-css');
   var rev = require('gulp-rev');
   var ngConfig = require('gulp-ng-config');
+  var protractor = require("gulp-protractor");
   var del = require('del');
   var fs = require('fs');
   var raml_mock = require('raml-mocker-server');
@@ -125,6 +127,17 @@
     });
   });
 
+  gulp.task('test-server', ['ws', 'watchScss'], function() {
+    bs.init({
+      proxy: {
+        target: lanternBackend,
+        ws: true
+      },
+      open: false,
+      serveStatic: ['.', 'app']
+    });
+  });
+
   gulp.task('dist-server', ['dist-env', 'ws', 'watchScss'], function() {
     bs.init({
       proxy: {
@@ -133,6 +146,20 @@
       },
       serveStatic: ['.', 'dist']
     });
+  });
+
+  gulp.task('webdriver_update', protractor.webdriver_update);
+
+  gulp.task('run-test', ['test-server', 'webdriver_update'], function() {
+    var completion = gulp.src(["features/*.feature"])
+    .pipe(protractor.protractor({
+      configFile: "config/protractor.conf.js"
+    }));
+    return completion;
+  });
+
+  gulp.task('test', ['run-test'], function() {
+    bs.exit();
   });
 
   gulp.task('default', ['server', 'dev-env', 'mock'], function() {
