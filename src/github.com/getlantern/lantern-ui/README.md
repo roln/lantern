@@ -104,8 +104,6 @@ tests.
 For end-to-end test, additional packages are required:
 
     npm install -g cucumber protractor
-    webdriver-manager update
-    webdriver-manager start
 
 Then `gulp test`.
 
