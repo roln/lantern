@@ -43,10 +43,10 @@ func dialDirect(network string, addr string) (conn, error) {
 		log.Tracef("Dial directly to %s succeeded", addr)
 		return &directConn{Conn: conn, addr: addr, readBytes: 0}, nil
 	} else if detector.TamperingSuspected(err) {
-		log.Debugf("Tampering suspected: %s", err)
+		log.Debugf("Dial directly to %s, tampering suspected: %s", addr, err)
 		AddToWl(addr, false)
 	} else {
-		log.Debug(err)
+		log.Debugf("Dial directly to %s failed: %s", addr, err)
 	}
 	return nil, err
 }

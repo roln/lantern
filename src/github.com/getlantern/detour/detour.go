@@ -1,29 +1,42 @@
 /*
-Package detour provides a net.Conn interface which detects blockage
-of a site automatically and access it through alternative connection.
+Package detour provides a net.Conn interface which detects blockage of a
+site automatically and access it through alternative connection.
 
 Basically, if a site is not whitelisted, following steps will be taken:
-1. Dial proxied connection (detour) a small delay after dialed directly
-2. Return to caller when any connection is established
-3. Read/write through all open connections in parallel
-4. Check for blockage on direct connection and closes it if it happens
-5. If possible, replay operations on detour connection. [1]
-6. After sucessfully read from a connection, stick with it and close others.
-7. Add those sites failed on direct connection but succeeded on detour ones
-   to proxied list, so above steps can be skipped next time. The list can be
-   exported and persisted if required.
 
-Blockage can happen at several stages of a connection, what detour can detect are:
-1. Connection attempt is blocked (IP blocking / DNS hijack).
-   Symptoms can be connection time out / TCP RST / connection refused.
-2. Connection made but real data get blocked (DPI).
-3. Successfully exchanged a few packets, while follow up packets are blocked. [2]
+1. Dial proxied connection (detour) a small delay after dialed directly.
+
+2. Return to caller when any connection is established.
+
+3. Read/write through all open connections in parallel.
+
+4. Check for blockage on direct connection and closes it if it happens.
+
+5. If possible, replay operations on detour connection[1].
+
+6. After sucessfully read from a connection, stick with it and close others.
+
+7. Add those sites failed on direct connection but succeeded on detour ones to
+proxied list, so above steps can be skipped next time. The list can be exported
+and persisted if required.
+
+8. Caller can optionally provide a channel to receive the sites which can be
+accessed directly without any error.
+
+Blockage can happen at several stages of a connection, what detour can detect
+are:
+
+1. Connection attempt is blocked (IP blocking / DNS hijack). Symptoms can be
+connection time out / connection refused / TCP RST.
+
+2. Connection made but not able to transfer any data (DPI).
+
+3. Successfully sent a few packets, but failed to receive any data[2].
+
 4. Connection made but get fake response or HTTP redirect to a fixed URL.
 
-[1] Detour will not replay nonidempotent plain HTTP requests, but will add it to
-    proxied list to be detoured next time.
-[2] Detour can only handle exact 1 successful read followed by failed read,
-    which covers most cases in reality.
+[1] Detour will not replay nonidempotent plain HTTP requests, but will add it
+to proxied list to be detoured next time.
 */
 package detour
 
@@ -31,7 +44,6 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -43,17 +55,14 @@ import (
 // If no any connection made after this period, stop dialing and fail
 var TimeoutToConnect = 30 * time.Second
 
-// To avoid unnecessarily proxy not-blocked url, detour will dial detour connection
-// after this small delay. Set to zero to dial in parallel to not introducing any delay.
+// To avoid unnecessarily proxy not-blocked url, detour will dial detour
+// connection after this small delay. Set to zero will dial in parallel, hence not
+// introducing any delay.
 var DelayBeforeDetour = 0 * time.Millisecond
 
 // If DirectAddrCh is set, when a direct connection is closed without any error,
-// the connection's remote address (in host:port format) will be send to it
+// the connection's remote address (in host:port format) will be send to it.
 var DirectAddrCh = make(chan string)
-
-var (
-	log = golog.LoggerFor("detour")
-)
 
 // Conn implements an net.Conn interface by utilizing underlie direct and
 // detour connections.
@@ -65,51 +74,56 @@ type Conn struct {
 
 	// The chan to notify dialer to dial detour immediately
 	chDialDetourNow chan bool
-	chConnToIOLoop  chan conn
-	chClose         chan struct{}
-	chGetAddr       chan getAddrRequest
-	chReadRequest   chan ioRequest
-	chWriteRequest  chan ioRequest
+	// chan to pass connections to I/O loop
+	chConnToIOLoop chan conn
+	// a signal to close connections
+	chClose chan struct{}
+	// signal I/O loop to get local or remote addr
+	chGetAddr chan getAddrRequest
+	// signal I/O loop to read
+	chReadRequest chan readRequest
+	// signal I/O loop to write
+	chWriteRequest chan writeRequest
 
+	// the target address to visit
 	addr string
 
 	muWriteBuffer sync.RWMutex
 	// Keeps written bytes through direct connection to replay it if required.
-	writeBuffer *bytes.Buffer
+	writeBuffer bytes.Buffer
 	// Is it a plain HTTP request or not, atomic
 	nonidempotentHTTPRequest uint32
 }
 
-// The data structure to pass result of io operation back from underlie connection
-type ioResult struct {
+// to pass result of read operation back from underlie connection
+type readResult struct {
+	// buffer to hold the received data, it's not necessarily the same buffer as readRequest.
 	buf []byte
-	// Number of bytes read/wrote
+	// IO error, if any
+	err error
+}
+
+type readRequest struct {
+	buf      []byte
+	chResult chan readResult
+}
+
+// to pass result of write operation back from underlie connection
+type writeResult struct {
+	// bytes written
 	n int
 	// IO error, if any
 	err error
 }
 
-type ioRequest struct {
+type writeRequest struct {
 	buf      []byte
-	chResult chan ioResult
+	chResult chan writeResult
 }
 
 type getAddrRequest struct {
 	isLocal  bool
 	chResult chan net.Addr
-}
-
-type connType int
-
-const (
-	connTypeDirect connType = iota
-	connTypeDetour connType = iota
-)
-
-var connTypeDesc = []string{"direct", "detour"}
-
-func (c connType) String() string {
-	return connTypeDesc[c]
 }
 
 type conn interface {
@@ -121,6 +135,19 @@ type conn interface {
 	RemoteAddr() net.Addr
 }
 
+type connType int
+
+const (
+	connTypeDirect connType = iota
+	connTypeDetour connType = iota
+)
+
+var connTypeDesc = []string{"direct", "detour"}
+
+func (c connType) String() string { return connTypeDesc[c] }
+
+var log = golog.LoggerFor("detour")
+
 type dialFunc func(network, addr string) (net.Conn, error)
 
 // Dialer returns a function with same signature of net.Dialer.Dial().
@@ -128,11 +155,10 @@ func Dialer(detourDialer dialFunc) func(network, addr string) (net.Conn, error) 
 	return func(network, addr string) (net.Conn, error) {
 		dc := &Conn{
 			addr:            addr,
-			writeBuffer:     new(bytes.Buffer),
 			chConnToIOLoop:  make(chan conn),
 			chClose:         make(chan struct{}),
-			chReadRequest:   make(chan ioRequest),
-			chWriteRequest:  make(chan ioRequest),
+			chReadRequest:   make(chan readRequest),
+			chWriteRequest:  make(chan writeRequest),
 			chDialDetourNow: make(chan bool),
 			chGetAddr:       make(chan getAddrRequest),
 		}
@@ -146,6 +172,7 @@ func Dialer(detourDialer dialFunc) func(network, addr string) (net.Conn, error) 
 		if !whitelisted(addr) {
 			numDial = 2
 		}
+		// Dialing logic
 		go func() {
 			if numDial == 2 {
 				go func() {
@@ -169,6 +196,8 @@ func Dialer(detourDialer dialFunc) func(network, addr string) (net.Conn, error) 
 		}()
 
 		chLastError := make(chan error, 2)
+		// Merge dialing results. Run until all dialing attempt returns
+		// to prevent leaking connections.
 		go func() {
 			var res dialResult
 			for i := 0; i < numDial; i++ {
@@ -184,6 +213,7 @@ func Dialer(detourDialer dialFunc) func(network, addr string) (net.Conn, error) 
 		go dc.ioLoop()
 		t := time.NewTimer(TimeoutToConnect)
 		defer t.Stop()
+		// Wait for first available connection and return, or fail if none available.
 		select {
 		case lastError := <-chLastError:
 			if lastError != nil {
@@ -196,13 +226,15 @@ func Dialer(detourDialer dialFunc) func(network, addr string) (net.Conn, error) 
 	}
 }
 
-// ioLoop waits for connections and handles read/write requests
+// ioLoop is the core of detour. It waits for connections and handles read/write requests
 func (dc *Conn) ioLoop() {
 	// Use buffered channel in same goroutine so we can easily add / remove
 	// connections. Should switch to container/ring if performace matters.
 	chConns := make(chan conn, 2)
+	// Requests ioLoop to remove already closed connections.
 	chRemoveConn := make(chan conn, 2)
-	var firstReadReq *ioRequest
+	// Hold the read request so we can re-read after replay.
+	var firstReadReq *readRequest
 	for {
 		select {
 		case c := <-dc.chConnToIOLoop:
@@ -212,21 +244,25 @@ func (dc *Conn) ioLoop() {
 				closeConn(c)
 				continue
 			}
-			chConns <- c
 			if firstReadReq != nil {
 				if !dc.replay(c) {
+					closeConn(c)
 					continue
 				}
 				go func() {
-					n, err := c.Read(firstReadReq.buf, true)
+					buf := make([]byte, len(firstReadReq.buf))
+					n, err := c.Read(buf, true)
 					if err != nil {
 						log.Debugf("Read from %s connection to %s failed: %s", c.Type(), dc.addr, err)
+						closeConn(c)
+						chRemoveConn <- c
 					} else {
 						log.Tracef("Read %d bytes from %s connection to %s", n, c.Type(), dc.addr)
 					}
-					firstReadReq.chResult <- ioResult{firstReadReq.buf, n, err}
+					firstReadReq.chResult <- readResult{buf[:n], err}
 				}()
 			}
+			chConns <- c
 		case r := <-chRemoveConn:
 			tries := len(chConns)
 			for i := 0; i < tries; i++ {
@@ -237,11 +273,12 @@ func (dc *Conn) ioLoop() {
 			}
 		case req := <-dc.chReadRequest:
 			tries := len(chConns)
-			chs := make(chan ioResult, tries)
+			chs := make(chan readResult, tries)
 			first := !dc.anyDataReceived()
 			if first {
-				firstReadReq = &ioRequest{make([]byte, len(req.buf)), chs}
+				firstReadReq = &readRequest{req.buf, chs}
 			}
+			// read from all valid connections, typically only one
 			for i := 0; i < tries; i++ {
 				c := <-chConns
 				chConns <- c
@@ -249,7 +286,7 @@ func (dc *Conn) ioLoop() {
 				go func() {
 					log.Tracef("Read via %s connection to %s, first: %v", c.Type(), dc.addr, first)
 					n, err := c.Read(buf, first)
-					if err != nil && err != io.EOF {
+					if err != nil {
 						log.Tracef("Read from %s connection to %s failed, closing: %s", c.Type(), dc.addr, err)
 						closeConn(c)
 						chRemoveConn <- c
@@ -266,18 +303,29 @@ func (dc *Conn) ioLoop() {
 						log.Tracef("Read %d bytes from %s connection to %s", n, c.Type(), dc.addr)
 						dc.incReadBytes(n)
 					}
-					chs <- ioResult{buf, n, err}
+					chs <- readResult{buf[:n], err}
 				}()
 			}
+			// Merge read responses, return only one copy to caller and ignore others.
+			// The response of re-read request also goes here
 			go func() {
+				var got bool
 				for i := 0; i < tries; i++ {
 					result := <-chs
 					if result.err != nil && i < tries-1 {
-						log.Debugf("Error read from %s, skip", dc.addr)
+						log.Debugf("Error read from %s, ignore: %s", dc.addr, result.err)
 						continue
 					}
-					n := copy(req.buf, result.buf[:result.n])
-					req.chResult <- ioResult{req.buf, n, result.err}
+					if got {
+						log.Tracef("Ignore late copy of response from %s", dc.addr)
+						continue
+					}
+					n := len(result.buf)
+					if n > 0 {
+						_ = copy(req.buf, result.buf)
+					}
+					req.chResult <- readResult{req.buf[:n], result.err}
+					got = true
 				}
 			}()
 		case req := <-dc.chWriteRequest:
@@ -304,9 +352,9 @@ func (dc *Conn) ioLoop() {
 				}
 			}
 			if lastN > 0 {
-				req.chResult <- ioResult{req.buf, lastN, nil}
+				req.chResult <- writeResult{lastN, nil}
 			} else {
-				req.chResult <- ioResult{req.buf, 0, errors.New("fail to write to any connection")}
+				req.chResult <- writeResult{0, errors.New("fail to write to any connection")}
 			}
 		case req := <-dc.chGetAddr:
 			if len(chConns) == 0 {
@@ -333,17 +381,18 @@ func (dc *Conn) replay(c conn) bool {
 	if atomic.LoadUint32(&dc.nonidempotentHTTPRequest) == 1 {
 		log.Tracef("Not replay nonidempotent request to %s, only add to whitelist", dc.addr)
 		AddToWl(dc.addr, false)
-		closeConn(c)
 		return false
 	}
 	dc.muWriteBuffer.RLock()
 	defer dc.muWriteBuffer.RUnlock()
 	numBytes := dc.writeBuffer.Len()
-	if numBytes > 0 {
-		log.Tracef("Replay %d previous bytes to %s connection to %s", numBytes, c.Type(), dc.addr)
-		if _, err := c.Write(dc.writeBuffer.Bytes()); err != nil {
-			log.Debugf("Fail to replay %s bytes to %s", numBytes, dc.addr)
-		}
+	if numBytes == 0 {
+		return false
+	}
+	log.Tracef("Replay %d previous bytes to %s connection to %s", numBytes, c.Type(), dc.addr)
+	if _, err := c.Write(dc.writeBuffer.Bytes()); err != nil {
+		log.Debugf("Fail to replay %s bytes to %s: %s", numBytes, dc.addr, err)
+		return false
 	}
 	return true
 }
@@ -358,24 +407,19 @@ func (dc *Conn) incReadBytes(n int) {
 
 // Read() implements the function from net.Conn
 func (dc *Conn) Read(b []byte) (n int, err error) {
-	chResult := make(chan ioResult)
-	dc.chReadRequest <- ioRequest{b, chResult}
-	result := <-chResult
-	log.Tracef("Read %d bytes from %s", result.n, dc.addr)
-	return result.n, result.err
+	ch := make(chan readResult)
+	dc.chReadRequest <- readRequest{b, ch}
+	result := <-ch
+	return len(result.buf), result.err
+
 }
 
 // Write() implements the function from net.Conn
 func (dc *Conn) Write(b []byte) (n int, err error) {
-	chResult := make(chan ioResult)
-	dc.chWriteRequest <- ioRequest{b, chResult}
-	result := <-chResult
-	if n, err = result.n, result.err; err != nil {
-		log.Tracef("Error writing to %s: %s", dc.addr, err)
-		return
-	}
-	log.Tracef("Wrote %d bytes to %s", n, dc.addr)
-	return
+	ch := make(chan writeResult)
+	dc.chWriteRequest <- writeRequest{b, ch}
+	result := <-ch
+	return result.n, result.err
 }
 
 // Close implements the function from net.Conn
@@ -413,6 +457,7 @@ func (dc *Conn) SetWriteDeadline(t time.Time) error {
 	return fmt.Errorf("SetWriteDeadline not implemented")
 }
 
+// close with trace
 func closeConn(c conn) {
 	if err := c.Close(); err != nil {
 		log.Tracef("Error close %s connection to %s: %s", c.Type(), c.RemoteAddr().String(), err)
@@ -425,7 +470,7 @@ var nonidempotentMethods = [][]byte{
 	[]byte("PATCH "),
 }
 
-// Ref section 9.1.2 of https://www.ietf.org/rfc/rfc2616.txt.
+// Ref https://tools.ietf.org/html/rfc2616#section-9.1.2
 // We consider the https handshake phase to be idemponent.
 func isNonidempotentHTTPRequest(b []byte) bool {
 	if len(b) > 4 {
