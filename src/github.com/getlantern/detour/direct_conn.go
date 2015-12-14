@@ -11,8 +11,6 @@ type directConn struct {
 	addr string
 	// keep track of the total bytes read by this connection, atomic
 	readBytes uint64
-	// a flag telling if connection is closed
-	closed uint32
 }
 
 var (
@@ -29,40 +27,39 @@ func init() {
 	blockDetector.Store(detectorByCountry(""))
 }
 
-func dialDirect(network string, addr string, ch chan conn) {
-	go func() {
-		log.Tracef("Dialing direct connection to %s", addr)
-		conn, err := net.DialTimeout(network, addr, TimeoutToConnect)
-		detector := blockDetector.Load().(*Detector)
-		if err == nil {
-			if detector.DNSPoisoned(conn) {
-				if err := conn.Close(); err != nil {
-					log.Debugf("Error closing direct connection to %s: %s", addr, err)
-				}
-				log.Debugf("Dial directly to %s, dns hijacked, add to whitelist", addr)
-				AddToWl(addr, false)
-				return
+func dialDirect(network string, addr string) (conn, error) {
+	log.Tracef("Dialing direct connection to %s", addr)
+	conn, err := net.DialTimeout(network, addr, TimeoutToConnect)
+	detector := blockDetector.Load().(*Detector)
+	if err == nil {
+		if detector.DNSPoisoned(conn) {
+			if err := conn.Close(); err != nil {
+				log.Debugf("Error closing direct connection to %s: %s", addr, err)
 			}
-			log.Tracef("Dial directly to %s succeeded", addr)
-			ch <- &directConn{Conn: conn, addr: addr, readBytes: 0}
-			return
-		} else if detector.TamperingSuspected(err) {
-			log.Debugf("Dial directly to %s, tampering suspected: %s", addr, err)
-			return
+			log.Debugf("Dial directly to %s, dns hijacked", addr)
+			AddToWl(addr, false)
+			return nil, fmt.Errorf("DNS hijacked")
 		}
-		log.Debugf("Dial directly to %s failed: %s", addr, err)
-	}()
+		log.Tracef("Dial directly to %s succeeded", addr)
+		return &directConn{Conn: conn, addr: addr, readBytes: 0}, nil
+	} else if detector.TamperingSuspected(err) {
+		log.Debugf("Tampering suspected: %s", err)
+		AddToWl(addr, false)
+	} else {
+		log.Debug(err)
+	}
+	return nil, err
 }
 
-func (dc *directConn) ConnType() connType {
+func (dc *directConn) Type() connType {
 	return connTypeDirect
 }
 
-func (dc *directConn) FirstRead(b []byte, ch chan ioResult) {
-	dc.doRead(b, checkFirstRead, ch)
-}
-func (dc *directConn) FollowupRead(b []byte, ch chan ioResult) {
-	dc.doRead(b, checkFollowupRead, ch)
+func (dc *directConn) Read(b []byte, isFirst bool) (int, error) {
+	if isFirst {
+		return dc.doRead(b, checkFirstRead)
+	}
+	return dc.doRead(b, checkFollowupRead)
 }
 
 type readChecker func([]byte, int, error, string) error
@@ -104,26 +101,16 @@ func checkFollowupRead(b []byte, n int, err error, addr string) error {
 	return nil
 }
 
-func (dc *directConn) doRead(b []byte, checker readChecker, ch chan ioResult) {
-	go func() {
-		n, err := dc.Conn.Read(b)
-		err = checker(b, n, err, dc.addr)
-		if err != nil {
-			b = nil
-			n = 0
-		} else {
-			atomic.AddUint64(&dc.readBytes, uint64(n))
-		}
-		ch <- ioResult{n, err, dc}
-	}()
-	return
-}
-
-func (dc *directConn) Write(b []byte, ch chan ioResult) {
-	go func() {
-		n, err := dc.Conn.Write(b)
-		ch <- ioResult{n, err, dc}
-	}()
+func (dc *directConn) doRead(b []byte, checker readChecker) (int, error) {
+	n, err := dc.Conn.Read(b)
+	err = checker(b, n, err, dc.addr)
+	if err != nil {
+		b = nil
+		n = 0
+	} else {
+		atomic.AddUint64(&dc.readBytes, uint64(n))
+	}
+	return n, err
 }
 
 func (dc *directConn) Close() (err error) {
@@ -136,10 +123,5 @@ func (dc *directConn) Close() (err error) {
 		default:
 		}
 	}
-	atomic.StoreUint32(&dc.closed, 1)
 	return
-}
-
-func (dc *directConn) Closed() bool {
-	return atomic.LoadUint32(&dc.closed) == 1
 }

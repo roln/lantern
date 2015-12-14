@@ -1,13 +1,16 @@
 package detour
 
 import (
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"testing"
 	"time"
 
+	"github.com/getlantern/golog"
 	"github.com/getlantern/testify/assert"
 )
 
@@ -21,9 +24,21 @@ Connection:close
 </title></head><body><iframe src="http://10.10.34.34?type=Invalid Site&policy=MainPolicy " style="width: 100%; height: 100%" scrolling="no" marginwidth="0" marginheight="0" frameborder="0" vspace="0" hspace="0"></iframe></body></html>Connection closed by foreign host.`
 )
 
+// timestamped adds a timestamp to the beginning of log lines
+type timestamped struct {
+	io.Writer
+}
+
+func (t timestamped) Write(p []byte) (int, error) {
+	logTimestampFormat := "Jan 02 15:04:05.000"
+	// Write in single operation to prevent different log items from interleaving
+	return io.WriteString(t.Writer, time.Now().In(time.UTC).Format(logTimestampFormat)+" "+string(p))
+}
+
 func init() {
 	TimeoutToConnect = 150 * time.Millisecond
 	DelayBeforeDetour = 50 * time.Millisecond
+	golog.SetOutputs(timestamped{os.Stderr}, timestamped{os.Stdout})
 }
 
 func TestTampering(t *testing.T) {
@@ -58,10 +73,10 @@ func TestReadTimeout(t *testing.T) {
 	assert.Error(t, err, "direct access to a timeout url should fail")
 
 	u, _ := url.Parse(mockURL)
-	client = newClient(proxiedURL, 100*time.Millisecond)
+	client = newClient(proxiedURL, 150*time.Millisecond)
 	resp, err = client.Get(mockURL)
 	if assert.NoError(t, err, "should have no error if reading times out") {
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
 		assert.True(t, wlTemporarily(u.Host), "should be added to whitelist if reading times out")
 		assertContent(t, resp, detourMsg, "should detour if reading times out")
 	}
@@ -98,7 +113,7 @@ func TestBlockedAfterwards(t *testing.T) {
 	resp, err = client.Get(mockURL)
 	if assert.NoError(t, err, "but should have no error for the second time") {
 		u, _ := url.Parse(mockURL)
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 		assertContent(t, resp, detourMsg, "should detour if reading times out")
 		assert.True(t, wlTemporarily(u.Host), "should be added to whitelist if reading times out")
 	}
@@ -115,6 +130,7 @@ func TestRemoveFromWhitelist(t *testing.T) {
 	AddToWl(u.Host, false)
 	_, err := client.Get(mockURL)
 	if assert.Error(t, err, "should have error if reading times out through detour") {
+		time.Sleep(50 * time.Millisecond)
 		assert.False(t, whitelisted(u.Host), "should be removed from whitelist if reading times out through detour")
 	}
 

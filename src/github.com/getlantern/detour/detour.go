@@ -29,7 +29,9 @@ package detour
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -61,19 +63,13 @@ type Conn struct {
 	// manual alignment. For this, it is best to keep it as the first field
 	readBytes uint64
 
-	// The underlie connections, uses buffered channel as ring queue to avoid
-	// locking. We have at most 2 connetions so a length of 2 is enough.
-	conns chan conn
-
 	// The chan to notify dialer to dial detour immediately
 	chDialDetourNow chan bool
-	// The channel to notify read/write that a detour connection is available
-	chDetourConn chan conn
-
-	// The chan to receive result of any read operation
-	chRead chan ioResult
-	// The chan to receive result of any write operation
-	chWrite chan ioResult
+	chConnToIOLoop  chan conn
+	chClose         chan struct{}
+	chGetAddr       chan getAddrRequest
+	chReadRequest   chan ioRequest
+	chWriteRequest  chan ioRequest
 
 	addr string
 
@@ -86,12 +82,21 @@ type Conn struct {
 
 // The data structure to pass result of io operation back from underlie connection
 type ioResult struct {
+	buf []byte
 	// Number of bytes read/wrote
 	n int
 	// IO error, if any
 	err error
-	// The underlie connection itself
-	conn conn
+}
+
+type ioRequest struct {
+	buf      []byte
+	chResult chan ioResult
+}
+
+type getAddrRequest struct {
+	isLocal  bool
+	chResult chan net.Addr
 }
 
 type connType int
@@ -101,20 +106,19 @@ const (
 	connTypeDetour connType = iota
 )
 
-type conn interface {
-	ConnType() connType
-	FirstRead(b []byte, ch chan ioResult)
-	FollowupRead(b []byte, ch chan ioResult)
-	Write(b []byte, ch chan ioResult)
-	Close() error
-	Closed() bool
-	LocalAddr() net.Addr
-	RemoteAddr() net.Addr
+var connTypeDesc = []string{"direct", "detour"}
+
+func (c connType) String() string {
+	return connTypeDesc[c]
 }
 
-func typeOf(c conn) string {
-	var connTypeDesc = []string{"direct", "detour"}
-	return connTypeDesc[c.ConnType()]
+type conn interface {
+	Type() connType
+	Read(b []byte, isFirst bool) (int, error)
+	Write(b []byte) (int, error)
+	Close() error
+	LocalAddr() net.Addr
+	RemoteAddr() net.Addr
 }
 
 type dialFunc func(network, addr string) (net.Conn, error)
@@ -125,78 +129,223 @@ func Dialer(detourDialer dialFunc) func(network, addr string) (net.Conn, error) 
 		dc := &Conn{
 			addr:            addr,
 			writeBuffer:     new(bytes.Buffer),
-			conns:           make(chan conn, 2),
-			chDetourConn:    make(chan conn),
-			chRead:          make(chan ioResult),
-			chWrite:         make(chan ioResult),
+			chConnToIOLoop:  make(chan conn),
+			chClose:         make(chan struct{}),
+			chReadRequest:   make(chan ioRequest),
+			chWriteRequest:  make(chan ioRequest),
 			chDialDetourNow: make(chan bool),
+			chGetAddr:       make(chan getAddrRequest),
 		}
-		// use buffered channel as we may send twice to it but only receive once
-		chAnyConn := make(chan bool, 1)
-		ch := make(chan conn)
 
-		// dialing sequence
-		if whitelisted(addr) {
-			dialDetour(network, addr, detourDialer, ch)
-		} else {
-			go func() {
-				dialDirect(network, addr, ch)
+		type dialResult struct {
+			c   conn
+			err error
+		}
+		ch := make(chan dialResult)
+		numDial := 1
+		if !whitelisted(addr) {
+			numDial = 2
+		}
+		go func() {
+			if numDial == 2 {
+				go func() {
+					c, err := dialDirect(network, addr)
+					ch <- dialResult{c, err}
+				}()
 				dt := time.NewTimer(DelayBeforeDetour)
+				defer dt.Stop()
 				select {
 				case <-dt.C:
 				case <-dc.chDialDetourNow:
 				}
 				if dc.anyDataReceived() {
-					ch <- nil
-					return
-				}
-				dialDetour(network, addr, detourDialer, ch)
-			}()
-		}
-
-		// handle dialing result
-		go func() {
-			t := time.NewTimer(TimeoutToConnect)
-			defer t.Stop()
-			// At most 2 connections will be made
-			for i := 0; i < 2; i++ {
-				log.Tracef("Waiting for connection to %s, round %d", dc.addr, i)
-				select {
-				case c := <-ch:
-					if c == nil {
-						log.Tracef("No new connection to %s remaining, return", dc.addr)
-						return
-					}
-					// first connection made, pass it back to caller
-					if i == 0 {
-						dc.conns <- c
-						chAnyConn <- true
-					} else {
-						if c.ConnType() == connTypeDirect {
-							// Could happen if direct route is much slower.
-							log.Debugf("Direct connection to %s established too late, close it", dc.addr)
-							if err := c.Close(); err != nil {
-								log.Debugf("Error closing direct connection to %s: %s", dc.addr, err)
-							}
-							return
-						}
-						log.Tracef("Feed detour connection to %s to read/write op", dc.addr)
-						dc.chDetourConn <- c
-						return
-					}
-				case <-t.C:
-					// still no connection made
-					chAnyConn <- false
 					return
 				}
 			}
+			go func() {
+				c, err := dialDetour(network, addr, detourDialer)
+				ch <- dialResult{c, err}
+			}()
 		}()
-		// return to caller if any connection available
-		if anyConn := <-chAnyConn; anyConn {
+
+		chLastError := make(chan error, 2)
+		go func() {
+			var res dialResult
+			for i := 0; i < numDial; i++ {
+				res = <-ch
+				if res.err == nil {
+					dc.chConnToIOLoop <- res.c
+					chLastError <- nil
+				}
+			}
+			chLastError <- res.err
+		}()
+
+		go dc.ioLoop()
+		t := time.NewTimer(TimeoutToConnect)
+		defer t.Stop()
+		select {
+		case lastError := <-chLastError:
+			if lastError != nil {
+				return nil, lastError
+			}
 			return dc, nil
+		case <-t.C:
+			return nil, fmt.Errorf("Timeout dialing any connection to %s", addr)
 		}
-		return nil, fmt.Errorf("Timeout dialing any connection to %s", addr)
 	}
+}
+
+// ioLoop waits for connections and handles read/write requests
+func (dc *Conn) ioLoop() {
+	// Use buffered channel in same goroutine so we can easily add / remove
+	// connections. Should switch to container/ring if performace matters.
+	chConns := make(chan conn, 2)
+	chRemoveConn := make(chan conn, 2)
+	var firstReadReq *ioRequest
+	for {
+		select {
+		case c := <-dc.chConnToIOLoop:
+			log.Tracef("I/O loop got %s connection to %s", c.Type(), dc.addr)
+			if dc.anyDataReceived() {
+				log.Debugf("%s connection to %s available after data received, closing", c.Type(), dc.addr)
+				closeConn(c)
+				continue
+			}
+			chConns <- c
+			if firstReadReq != nil {
+				if !dc.replay(c) {
+					continue
+				}
+				go func() {
+					n, err := c.Read(firstReadReq.buf, true)
+					if err != nil {
+						log.Debugf("Read from %s connection to %s failed: %s", c.Type(), dc.addr, err)
+					} else {
+						log.Tracef("Read %d bytes from %s connection to %s", n, c.Type(), dc.addr)
+					}
+					firstReadReq.chResult <- ioResult{firstReadReq.buf, n, err}
+				}()
+			}
+		case r := <-chRemoveConn:
+			tries := len(chConns)
+			for i := 0; i < tries; i++ {
+				c := <-chConns
+				if c != r {
+					chConns <- c
+				}
+			}
+		case req := <-dc.chReadRequest:
+			tries := len(chConns)
+			chs := make(chan ioResult, tries)
+			first := !dc.anyDataReceived()
+			if first {
+				firstReadReq = &ioRequest{make([]byte, len(req.buf)), chs}
+			}
+			for i := 0; i < tries; i++ {
+				c := <-chConns
+				chConns <- c
+				buf := make([]byte, len(req.buf))
+				go func() {
+					log.Tracef("Read via %s connection to %s, first: %v", c.Type(), dc.addr, first)
+					n, err := c.Read(buf, first)
+					if err != nil && err != io.EOF {
+						log.Tracef("Read from %s connection to %s failed, closing: %s", c.Type(), dc.addr, err)
+						closeConn(c)
+						chRemoveConn <- c
+						switch c.Type() {
+						case connTypeDirect:
+							// if we haven't dial detour yet, do so now
+							dc.chDialDetourNow <- true
+							return
+						case connTypeDetour:
+							log.Tracef("Detour connection to %s failed, removing from whitelist", dc.addr)
+							RemoveFromWl(dc.addr)
+						}
+					} else {
+						log.Tracef("Read %d bytes from %s connection to %s", n, c.Type(), dc.addr)
+						dc.incReadBytes(n)
+					}
+					chs <- ioResult{buf, n, err}
+				}()
+			}
+			go func() {
+				for i := 0; i < tries; i++ {
+					result := <-chs
+					if result.err != nil && i < tries-1 {
+						log.Debugf("Error read from %s, skip", dc.addr)
+						continue
+					}
+					n := copy(req.buf, result.buf[:result.n])
+					req.chResult <- ioResult{req.buf, n, result.err}
+				}
+			}()
+		case req := <-dc.chWriteRequest:
+			if !dc.anyDataReceived() {
+				if isNonidempotentHTTPRequest(req.buf) {
+					atomic.StoreUint32(&dc.nonidempotentHTTPRequest, 1)
+				} else {
+					dc.muWriteBuffer.Lock()
+					_, _ = dc.writeBuffer.Write(req.buf)
+					dc.muWriteBuffer.Unlock()
+				}
+			}
+			var lastN int
+			tries := len(chConns)
+			for i := 0; i < tries; i++ {
+				c := <-chConns
+				if n, err := c.Write(req.buf); err != nil {
+					log.Debugf("Error write to %s connection to %s", c.Type(), dc.addr)
+					closeConn(c)
+				} else {
+					log.Tracef("Wrote %v bytes to %s connection to %s", n, c.Type(), dc.addr)
+					lastN = n
+					chConns <- c
+				}
+			}
+			if lastN > 0 {
+				req.chResult <- ioResult{req.buf, lastN, nil}
+			} else {
+				req.chResult <- ioResult{req.buf, 0, errors.New("fail to write to any connection")}
+			}
+		case req := <-dc.chGetAddr:
+			if len(chConns) == 0 {
+				panic("should have at least one valid connection")
+			}
+			c := <-chConns
+			chConns <- c
+			if req.isLocal {
+				req.chResult <- c.LocalAddr()
+			} else {
+				req.chResult <- c.RemoteAddr()
+			}
+		case <-dc.chClose:
+			tries := len(chConns)
+			for i := 0; i < tries; i++ {
+				closeConn(<-chConns)
+			}
+			return
+		}
+	}
+}
+
+func (dc *Conn) replay(c conn) bool {
+	if atomic.LoadUint32(&dc.nonidempotentHTTPRequest) == 1 {
+		log.Tracef("Not replay nonidempotent request to %s, only add to whitelist", dc.addr)
+		AddToWl(dc.addr, false)
+		closeConn(c)
+		return false
+	}
+	dc.muWriteBuffer.RLock()
+	defer dc.muWriteBuffer.RUnlock()
+	numBytes := dc.writeBuffer.Len()
+	if numBytes > 0 {
+		log.Tracef("Replay %d previous bytes to %s connection to %s", numBytes, c.Type(), dc.addr)
+		if _, err := c.Write(dc.writeBuffer.Bytes()); err != nil {
+			log.Debugf("Fail to replay %s bytes to %s", numBytes, dc.addr)
+		}
+	}
+	return true
 }
 
 func (dc *Conn) anyDataReceived() bool {
@@ -209,142 +358,44 @@ func (dc *Conn) incReadBytes(n int) {
 
 // Read() implements the function from net.Conn
 func (dc *Conn) Read(b []byte) (n int, err error) {
-	if dc.anyDataReceived() {
-		return dc.followupRead(b)
-	}
-	// At initial stage, we only have one connection,
-	// but detour connection can be available at anytime.
-	if !dc.withValidConn(func(c conn) { c.FirstRead(b, dc.chRead) }) {
-		return 0, fmt.Errorf("no connection available to %s", dc.addr)
-	}
-	for count := 1; count > 0; count-- {
-		select {
-		case newConn := <-dc.chDetourConn:
-			if atomic.LoadUint32(&dc.nonidempotentHTTPRequest) == 1 {
-				log.Tracef("Not replay nonidempotent request to %s, only add to whitelist", dc.addr)
-				AddToWl(dc.addr, false)
-				if err := newConn.Close(); err != nil {
-					log.Debugf("Error closing detour connection to %s: %s", dc.addr, err)
-				}
-				return
-			}
-			log.Tracef("Got detour connection to %s, replay previous op on it", dc.addr)
-			dc.muWriteBuffer.RLock()
-			sentBytes := dc.writeBuffer.Bytes()
-			dc.muWriteBuffer.RUnlock()
-			newConn.Write(sentBytes, dc.chWrite)
-			newConn.FirstRead(b, dc.chRead)
-			count++
-			// add new connection to connections
-			dc.conns <- newConn
-		case result := <-dc.chRead:
-			conn, n, err := result.conn, result.n, result.err
-			if err != nil {
-				log.Tracef("Read from %s connection to %s failed, closing: %s", typeOf(conn), dc.addr, err)
-				if err := conn.Close(); err != nil {
-					log.Debugf("Error closing %s connection to %s: %s", typeOf(conn), dc.addr, err)
-				}
-				// skip failed connection as we have more
-				if count > 1 {
-					continue
-				}
-				switch conn.ConnType() {
-				case connTypeDirect:
-					// if we haven't dial detour yet, do so now
-					select {
-					case dc.chDialDetourNow <- true:
-						count++
-					default:
-					}
-					continue
-				case connTypeDetour:
-					log.Tracef("Detour connection to %s failed, removing from whitelist", dc.addr)
-					RemoveFromWl(dc.addr)
-					// no more connections, return directly to avoid dead lock
-					return n, err
-				}
-			}
-			log.Tracef("Read %d bytes from %s connection to %s", n, typeOf(conn), dc.addr)
-			dc.incReadBytes(n)
-			return n, err
-		}
-	}
-	return
-}
-
-// followUpRead is called by Read() if a connection's state already settled
-func (dc *Conn) followupRead(b []byte) (n int, err error) {
-	if !dc.withValidConn(func(c conn) { c.FollowupRead(b, dc.chRead) }) {
-		return 0, fmt.Errorf("no connection available to %s", dc.addr)
-	}
-	result := <-dc.chRead
-	dc.incReadBytes(result.n)
+	chResult := make(chan ioResult)
+	dc.chReadRequest <- ioRequest{b, chResult}
+	result := <-chResult
+	log.Tracef("Read %d bytes from %s", result.n, dc.addr)
 	return result.n, result.err
 }
 
 // Write() implements the function from net.Conn
 func (dc *Conn) Write(b []byte) (n int, err error) {
-	if dc.anyDataReceived() {
-		return dc.followupWrite(b)
-	}
-	if isNonidempotentHTTPRequest(b) {
-		atomic.StoreUint32(&dc.nonidempotentHTTPRequest, 1)
-	} else {
-		dc.muWriteBuffer.Lock()
-		_, _ = dc.writeBuffer.Write(b)
-		dc.muWriteBuffer.Unlock()
-	}
-	if !dc.withValidConn(func(c conn) { c.Write(b, dc.chWrite) }) {
-		return 0, fmt.Errorf("no connection available to %s", dc.addr)
-	}
-
-	result := <-dc.chWrite
+	chResult := make(chan ioResult)
+	dc.chWriteRequest <- ioRequest{b, chResult}
+	result := <-chResult
 	if n, err = result.n, result.err; err != nil {
-		log.Tracef("Error writing %s connection to %s: %s", typeOf(result.conn), dc.addr, err)
-		if err := result.conn.Close(); err != nil {
-			log.Debugf("Error closing %s connection to %s: %s", typeOf(result.conn), dc.addr, err)
-		}
+		log.Tracef("Error writing to %s: %s", dc.addr, err)
 		return
 	}
-	log.Tracef("Wrote %d bytes to %s connection to %s", n, typeOf(result.conn), dc.addr)
+	log.Tracef("Wrote %d bytes to %s", n, dc.addr)
 	return
-}
-
-// followupWrite is called by Write() if a connection's state already settled
-func (dc *Conn) followupWrite(b []byte) (n int, err error) {
-	if !dc.withValidConn(func(c conn) { c.Write(b, dc.chWrite) }) {
-		return 0, fmt.Errorf("no connection available to %s", dc.addr)
-	}
-	result := <-dc.chWrite
-	return result.n, result.err
 }
 
 // Close implements the function from net.Conn
 func (dc *Conn) Close() error {
-	log.Tracef("Closing connection to %s", dc.addr)
-	for len(dc.conns) > 0 {
-		conn := <-dc.conns
-		if err := conn.Close(); err != nil {
-			log.Debugf("Error closing %s connection to %s: %s", typeOf(conn), dc.addr, err)
-		}
-	}
+	close(dc.chClose)
 	return nil
 }
 
 // LocalAddr implements the function from net.Conn
 func (dc *Conn) LocalAddr() (addr net.Addr) {
-	if !dc.withValidConn(func(c conn) { addr = c.LocalAddr() }) {
-		panic("no valid connection to call LocalAddr()")
-	}
-	return
+	chResult := make(chan net.Addr)
+	dc.chGetAddr <- getAddrRequest{true, chResult}
+	return <-chResult
 }
 
 // RemoteAddr implements the function from net.Conn
 func (dc *Conn) RemoteAddr() (addr net.Addr) {
-	if !dc.withValidConn(func(c conn) { addr = c.RemoteAddr() }) {
-		panic("no valid connection to call RemoteAddr()")
-	}
-	return
+	chResult := make(chan net.Addr)
+	dc.chGetAddr <- getAddrRequest{false, chResult}
+	return <-chResult
 }
 
 // SetDeadline implements the function from net.Conn
@@ -362,22 +413,10 @@ func (dc *Conn) SetWriteDeadline(t time.Time) error {
 	return fmt.Errorf("SetWriteDeadline not implemented")
 }
 
-func (dc *Conn) withValidConn(f func(conn)) bool {
-	for i := 0; i < len(dc.conns); i++ {
-		select {
-		case c := <-dc.conns:
-			if c.Closed() {
-				log.Tracef("Drain closed %s connection to %s", typeOf(c), dc.addr)
-				continue
-			}
-			f(c)
-			dc.conns <- c
-			return true
-		default:
-			break
-		}
+func closeConn(c conn) {
+	if err := c.Close(); err != nil {
+		log.Tracef("Error close %s connection to %s: %s", c.Type(), c.RemoteAddr().String(), err)
 	}
-	return false
 }
 
 var nonidempotentMethods = [][]byte{
